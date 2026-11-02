@@ -1,38 +1,197 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ResolveInput, Timer } from 'claude-code'
 
-import type { SpeechInsertConfig, SpeechInsertField, SpeechInsertPhase } from '../types'
+import type {
+  SpeechInsertConfig,
+  SpeechInsertDevice,
+  SpeechInsertField,
+  SpeechInsertHistoryItem,
+  SpeechInsertPhase,
+  SpeechInsertTest,
+} from '../types'
 
 const DEFAULTS: SpeechInsertConfig = {
   baseUrl: 'https://api.openai.com/v1',
   model: 'whisper-1',
   language: '',
   tokenHint: '',
+  microphone: '',
+  microphoneName: '',
 }
 
+const HISTORY_SIZE = 10
+
 const config = atom({ plugin: 'speech-insert', key: 'config' } as const, DEFAULTS, {
-  shape: 'config-1',
+  shape: 'config-2',
 })
 const phase = atom({ plugin: 'speech-insert', key: 'phase' } as const, 'idle' as SpeechInsertPhase)
 const isSettingsOpen = atom({ plugin: 'speech-insert', key: 'isSettingsOpen' } as const, false)
 const settingsField = atom({ plugin: 'speech-insert', key: 'settingsField' } as const, 'baseUrl' as SpeechInsertField)
+const devices = atom({ plugin: 'speech-insert', key: 'devices' } as const, null as SpeechInsertDevice[] | null, {
+  shape: 'devices-1',
+})
+const devicesError = atom({ plugin: 'speech-insert', key: 'devicesError' } as const, null as string | null)
+const test = atom({ plugin: 'speech-insert', key: 'test' } as const, null as SpeechInsertTest | null, {
+  shape: 'test-1',
+})
 const isEnabled = atom({ plugin: 'speech-insert', key: 'isEnabled' } as const, true)
 const isChatEnabled = atom({ plugin: 'speech-insert', key: 'isChatEnabled' } as const, true)
 const isConfirmingCancel = atom({ plugin: 'speech-insert', key: 'isConfirmingCancel' } as const, false)
 const elapsed = atom({ plugin: 'speech-insert', key: 'elapsed' } as const, 0)
 const levels = atom({ plugin: 'speech-insert', key: 'levels' } as const, [] as number[])
 const error = atom({ plugin: 'speech-insert', key: 'error' } as const, null as string | null)
+const canRetry = atom({ plugin: 'speech-insert', key: 'canRetry' } as const, false)
+const isHistoryOpen = atom({ plugin: 'speech-insert', key: 'isHistoryOpen' } as const, false)
+const history = atom({ plugin: 'speech-insert', key: 'history' } as const, [] as SpeechInsertHistoryItem[], {
+  shape: 'history-1',
+})
+
+type Platform = 'mac' | 'linux' | 'windows'
+
+// Found at session.start: Windows names itself in OS, uname tells the rest.
+let platform: Platform = 'mac'
+
+const detectPlatform = async ($: EngineInterface): Promise<Platform> => {
+  const os = await $.env.get('OS').catch(() => undefined)
+  if (os === 'Windows_NT') {
+    return 'windows'
+  }
+  const uname = await $.process.run(['uname', '-s']).catch(() => undefined)
+
+  return /linux/i.test(uname?.stdout ?? '') ? 'linux' : 'mac'
+}
+
+const exe = (name: string) => (platform === 'windows' ? `${name}.exe` : name)
+
+// Homebrew's folders join the PATH, as an app started from the Dock has
+// neither; Windows keeps its own.
+const toolEnv = async ($: EngineInterface) => {
+  if (platform === 'windows') {
+    return undefined
+  }
+  const path = (await $.env.get('PATH')) ?? '/usr/bin:/bin'
+
+  return { PATH: `/opt/homebrew/bin:/usr/local/bin:${path}` }
+}
+
+const tempFile = async ($: EngineInterface, name: string) => {
+  if (platform === 'windows') {
+    const dir = (await $.env.get('TEMP')) ?? (await $.env.get('TMP')) ?? 'C:\\Windows\\Temp'
+
+    return `${dir.replace(/[\\/]+$/, '')}\\${name}`
+  }
+  const dir = (await $.env.get('TMPDIR')) ?? '/tmp'
+
+  return `${dir.replace(/\/+$/, '')}/${name}`
+}
+
+const removeFile = ($: EngineInterface, file: string) =>
+  $.process.run(platform === 'windows' ? ['cmd.exe', '/d', '/c', 'del', '/f', '/q', file] : ['rm', '-f', file]).then(
+    () => undefined,
+    () => undefined,
+  )
+
+// The input ffmpeg records from: AVFoundation on macOS, PulseAudio (and
+// PipeWire, which speaks it) on Linux, DirectShow on Windows.
+const inputOf = (microphone: string) => {
+  if (platform === 'linux') {
+    return ['-f', 'pulse', '-i', microphone || 'default']
+  }
+  if (platform === 'windows') {
+    return ['-f', 'dshow', '-i', `audio=${microphone}`]
+  }
+
+  return ['-f', 'avfoundation', '-i', `:${microphone || 'default'}`]
+}
+
+// Beside the file, ffmpeg prints the loudness of every tenth of a second to
+// stdout (`direct=1`, unbuffered) for the meter. Each packet is written as it
+// is made, so a recording killed rather than stopped keeps all but the last.
+const recordArgs = (microphone: string, file: string) => [
+  '-nostdin',
+  '-hide_banner',
+  '-loglevel',
+  'error',
+  ...inputOf(microphone),
+  '-filter_complex',
+  '[0:a]aresample=16000,aformat=channel_layouts=mono,asplit=2[rec][meter];' +
+    '[meter]asetnsamples=n=1600,astats=metadata=1:reset=1,' +
+    'ametadata=mode=print:key=lavfi.astats.Overall.RMS_level:file=-:direct=1,anullsink',
+  '-map',
+  '[rec]',
+  '-c:a',
+  'libmp3lame',
+  '-b:a',
+  '64k',
+  '-flush_packets',
+  '1',
+  '-y',
+  file,
+]
 
 // The shell prints its pid first, and `exec` keeps that pid for ffmpeg, which
-// SIGINT then stops cleanly. Beside the file, ffmpeg prints the loudness of
-// every tenth of a second to stdout (`direct=1`, unbuffered) for the meter.
-const RECORD_SCRIPT =
-  'echo "pid:$$"; exec ffmpeg -nostdin -hide_banner -loglevel error ' +
-  '-f avfoundation -i :default -filter_complex "' +
-  '[0:a]aresample=16000,aformat=channel_layouts=mono,asplit=2[rec][meter];' +
-  '[meter]asetnsamples=n=1600,astats=metadata=1:reset=1,' +
-  'ametadata=mode=print:key=lavfi.astats.Overall.RMS_level:file=-:direct=1,anullsink" ' +
-  '-map "[rec]" -c:a libmp3lame -b:a 64k -y "$1"'
+// SIGINT then stops cleanly. Windows has no SIGINT to send, so there ffmpeg
+// runs bare and is killed.
+const recordArgv = (microphone: string, file: string) =>
+  platform === 'windows'
+    ? [exe('ffmpeg'), ...recordArgs(microphone, file)]
+    : ['/bin/sh', '-c', 'echo "pid:$$"; exec ffmpeg "$@"', 'sh', ...recordArgs(microphone, file)]
+
+// The microphones ffmpeg can record from, each as ffmpeg names it; on Linux,
+// PulseAudio's sources by their descriptions, monitors of outputs left out.
+const listDevices = async ($: EngineInterface): Promise<SpeechInsertDevice[]> => {
+  const env = await toolEnv($)
+  if (platform === 'linux') {
+    const ran = await $.process.run(['pactl', 'list', 'sources'], {
+      env: { ...env, LC_ALL: 'C' },
+      timeoutMs: 15_000,
+    })
+
+    return ran.stdout
+      .split(/^Source #/m)
+      .slice(1)
+      .map(block => {
+        const id = /^\s*Name: (.+)$/m.exec(block)?.[1]?.trim() ?? ''
+
+        return { id, name: /^\s*Description: (.+)$/m.exec(block)?.[1]?.trim() || id }
+      })
+      .filter(device => device.id && !device.id.endsWith('.monitor'))
+  }
+
+  const argv =
+    platform === 'windows'
+      ? [exe('ffmpeg'), '-nostdin', '-hide_banner', '-list_devices', 'true', '-f', 'dshow', '-i', 'dummy']
+      : [exe('ffmpeg'), '-nostdin', '-hide_banner', '-f', 'avfoundation', '-list_devices', 'true', '-i', '']
+  // Listing ends in an error by design: the list is on stderr all the same.
+  const { stderr } = await $.process.run(argv, { env, timeoutMs: 15_000 })
+  const names: string[] = []
+  if (platform === 'mac') {
+    const audio = stderr.split('AVFoundation audio devices:')[1] ?? ''
+    for (const match of audio.matchAll(/\] \[\d+\] (.+)$/gm)) {
+      names.push((match[1] ?? '').trim())
+    }
+  } else {
+    // Older builds head each kind with a line; newer ones tag each device.
+    let isAudio = false
+    for (const line of stderr.split(/\r?\n/)) {
+      if (/DirectShow (audio|video) devices/.test(line)) {
+        isAudio = line.includes('audio devices')
+        continue
+      }
+      const match = /\]\s+"(.+)"(?:\s+\((\w+)[^)]*\))?\s*$/.exec(line)
+      if (match?.[1] && !line.includes('Alternative name') && (match[2] ? match[2] === 'audio' : isAudio)) {
+        names.push(match[1])
+      }
+    }
+  }
+
+  return names.filter(Boolean).map(name => ({ id: name, name }))
+}
+
+const defaultDevice = (): SpeechInsertDevice => ({
+  id: '',
+  name: platform === 'windows' ? 'First microphone found' : 'System default',
+})
 
 const METER_BARS = 12
 const SILENT_DB = -60
@@ -54,6 +213,9 @@ type Recorder = {
 let recorder: Recorder | null = null
 // Counts the recording's seconds into `elapsed` while it runs.
 let ticker: Timer | null = null
+// A recording whose transcription failed, kept for ↻ until it succeeds, is
+// thrown away, or a new recording starts.
+let failed: string | null = null
 
 const stopTicker = () => {
   ticker?.cancel()
@@ -74,6 +236,8 @@ const fail = async ($: EngineInterface, message: string) => {
   $.ui.toast(`Speech: ${message}`)
 }
 
+type Api = { baseUrl: string; token: string; model: string; language: string }
+
 // $.store is one file for every session of this person, so settings saved in
 // one chat hold in all of them. Each use reads it afresh, and copies what the
 // form draws into this session's state.
@@ -89,35 +253,42 @@ const loadSettings = async ($: EngineInterface) => {
     model: await stored('model', DEFAULTS.model),
     language: await stored('language', DEFAULTS.language),
     tokenHint: hintOf(token),
+    microphone: await stored('microphone', DEFAULTS.microphone),
+    microphoneName: await stored('microphoneName', DEFAULTS.microphoneName),
   }
   await update($, config, () => loaded)
 
   return { ...loaded, token }
 }
 
-// The desktop draws a submit button beside every text field, so of the four
-// rows only the one being edited holds a field, and that field's own button
-// is the one Save for all of them; the other rows show their value.
+// The desktop draws a submit button beside every text field, so of the rows
+// only the one being edited holds a field, and that field's own button is the
+// one Save for all of them; the other rows show their value. The microphone
+// row opens a list instead, and a pick there is saved at once.
 const FIELDS: readonly { value: SpeechInsertField; label: string }[] = [
   { value: 'baseUrl', label: 'Base URL' },
   { value: 'token', label: 'API token' },
   { value: 'model', label: 'Model' },
   { value: 'language', label: 'Language' },
+  { value: 'microphone', label: 'Microphone' },
 ]
 
 // What the person typed in the settings form and has not saved yet. Typing
 // writes here alone, so no keystroke redraws the form under the cursor.
-let draft: Partial<Record<SpeechInsertField, string>> = {}
+let draft: Partial<Record<Exclude<SpeechInsertField, 'microphone'>, string>> = {}
 
 const openSettings = async ($: EngineInterface) => {
   draft = {}
   await loadSettings($)
   await update($, settingsField, () => 'baseUrl')
+  await update($, test, () => null)
+  await update($, isHistoryOpen, () => false)
   await update($, isSettingsOpen, () => true)
 }
 
 const closeSettings = async ($: EngineInterface) => {
   draft = {}
+  await update($, test, () => null)
   await update($, isSettingsOpen, () => false)
 }
 
@@ -139,27 +310,223 @@ const saveSettings = async ($: EngineInterface) => {
   $.ui.toast('Speech: settings saved')
 }
 
+const chooseMicrophone = async ($: EngineInterface) => {
+  await update($, settingsField, () => 'microphone')
+  await update($, devices, () => null)
+  await update($, devicesError, () => null)
+  try {
+    const found = await listDevices($)
+    await update($, devices, () => found)
+  } catch (thrown) {
+    const reason = thrown instanceof Error ? thrown.message : String(thrown)
+    await update($, devicesError, () => `could not list microphones: ${reason}`)
+  }
+}
+
+const pickMicrophone = async ($: EngineInterface, device: SpeechInsertDevice) => {
+  if (device.id) {
+    await $.store.set('microphone', device.id)
+    await $.store.set('microphoneName', device.name)
+  } else {
+    await $.store.delete('microphone')
+    await $.store.delete('microphoneName')
+  }
+  await loadSettings($)
+  await update($, settingsField, () => 'baseUrl')
+}
+
+const transcribe = async ($: EngineInterface, api: Api, file: string) => {
+  const argv = [
+    exe('curl'),
+    '-sS',
+    '--max-time',
+    '120',
+    '-X',
+    'POST',
+    transcriptionUrl(api.baseUrl),
+    // The token goes in on stdin, so it never shows in a process listing.
+    '-H',
+    '@-',
+    '-F',
+    `file=@${file};type=audio/mpeg`,
+    '--form-string',
+    `model=${api.model.trim() || DEFAULTS.model}`,
+    ...(api.language.trim() ? ['--form-string', `language=${api.language.trim()}`] : []),
+    '--form-string',
+    'response_format=json',
+    '-w',
+    '\n%{http_code}',
+  ]
+  const ran = await $.process.run(argv, {
+    stdin: `Authorization: Bearer ${api.token}\n`,
+    timeoutMs: 130_000,
+  })
+  if (ran.exitCode !== 0) {
+    throw new Error(ran.stderr.trim() || `curl exited with code ${ran.exitCode}`)
+  }
+
+  const cut = ran.stdout.lastIndexOf('\n')
+  const body = ran.stdout.slice(0, cut)
+  const status = Number(ran.stdout.slice(cut + 1))
+  let parsed: { text?: unknown; error?: { message?: unknown } | string } = {}
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    // Not JSON: the status and the raw body say what happened.
+  }
+  if (status < 200 || status >= 300) {
+    const message = typeof parsed.error === 'string' ? parsed.error : parsed.error?.message
+    throw new Error(`HTTP ${status}: ${String(message ?? body).slice(0, 300)}`)
+  }
+  if (typeof parsed.text !== 'string') {
+    throw new Error(`no text field in the response: ${body.slice(0, 300)}`)
+  }
+
+  return parsed.text.trim()
+}
+
+// Sends a second of silence with what the form holds, saved or not, so a
+// wrong URL, token or model shows before anything is recorded.
+const testSettings = async ($: EngineInterface) => {
+  if ((await read($, test))?.state === 'running') {
+    return
+  }
+  const saved = await loadSettings($)
+  const api: Api = {
+    baseUrl: draft.baseUrl ?? saved.baseUrl,
+    token: draft.token?.trim() || saved.token,
+    model: draft.model ?? saved.model,
+    language: draft.language ?? saved.language,
+  }
+  if (!api.token || !api.baseUrl.trim()) {
+    await update($, test, () => ({ state: 'failed', message: 'set the base URL and API token first' }))
+
+    return
+  }
+
+  await update($, test, () => ({ state: 'running', message: 'Testing…' }))
+  const file = await tempFile($, `speech-insert-test-${await $.clock.now()}.mp3`)
+  try {
+    const made = await $.process.run(
+      [
+        exe('ffmpeg'),
+        '-nostdin',
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-f',
+        'lavfi',
+        '-i',
+        'anullsrc=r=16000:cl=mono',
+        '-t',
+        '1',
+        '-c:a',
+        'libmp3lame',
+        '-b:a',
+        '64k',
+        '-y',
+        file,
+      ],
+      { env: await toolEnv($), timeoutMs: 15_000 },
+    )
+    if (made.exitCode !== 0) {
+      throw new Error(`ffmpeg: ${made.stderr.trim().split('\n').pop() || `exit code ${made.exitCode}`}`)
+    }
+    await transcribe($, api, file)
+    await update($, test, () => ({ state: 'passed', message: 'Works: the API took the token and the model' }))
+  } catch (thrown) {
+    const message = thrown instanceof Error ? thrown.message : String(thrown)
+    await update($, test, () => ({ state: 'failed', message }))
+  } finally {
+    await removeFile($, file)
+  }
+}
+
+const loadHistory = async ($: EngineInterface) => {
+  const value = await $.store.get('history')
+  const items = (Array.isArray(value) ? value : [])
+    .filter(
+      (item): item is SpeechInsertHistoryItem =>
+        typeof item?.text === 'string' && typeof item?.at === 'number' && item.text !== '',
+    )
+    .slice(0, HISTORY_SIZE)
+  await update($, history, () => items)
+
+  return items
+}
+
+// The newest first, in the store every chat shares; a repeat moves to the top.
+const remember = async ($: EngineInterface, text: string) => {
+  const now = await $.clock.now()
+  const items = [{ text, at: now }, ...(await loadHistory($)).filter(item => item.text !== text)].slice(0, HISTORY_SIZE)
+  await $.store.set('history', items)
+  await update($, history, () => items)
+}
+
+const openHistory = async ($: EngineInterface) => {
+  await closeSettings($)
+  await loadHistory($)
+  await update($, isHistoryOpen, () => true)
+}
+
+const insertAtCursor = async ($: EngineInterface, text: string) => {
+  const box = await $.prompt.read()
+  const before = box.text.slice(0, box.cursor)
+  const after = box.text.slice(box.cursor)
+  const lead = before && !/\s$/.test(before) ? ' ' : ''
+  const trail = after && !/^\s/.test(after) ? ' ' : ''
+  const filled = await $.prompt.fill({ text: lead + text + trail, mode: 'insert' })
+  if (!filled.isFilled) {
+    await $.ui.copy({ text })
+    $.ui.toast('Speech: no prompt box to fill, the text was copied to the clipboard')
+  }
+}
+
+const pickHistory = async ($: EngineInterface, item: SpeechInsertHistoryItem) => {
+  await update($, isHistoryOpen, () => false)
+  await insertAtCursor($, item.text)
+}
+
+const discardFailed = async ($: EngineInterface) => {
+  const file = failed
+  failed = null
+  await update($, canRetry, () => false)
+  await update($, error, () => null)
+  if (file) {
+    await removeFile($, file)
+  }
+}
+
 const startRecording = async ($: EngineInterface) => {
-  const { token, baseUrl } = await loadSettings($)
+  const { token, baseUrl, microphone } = await loadSettings($)
   if (!token || !baseUrl.trim()) {
     await openSettings($)
     await fail($, 'set the base URL and API token in settings (⚙)')
 
     return
   }
+  await discardFailed($)
 
-  const tmp = ((await $.env.get('TMPDIR')) ?? '/tmp').replace(/\/+$/, '')
-  const file = `${tmp}/speech-insert-${await $.clock.now()}.mp3`
-  const path = (await $.env.get('PATH')) ?? '/usr/bin:/bin'
-  const stream = $.process.spawn({
-    argv: ['/bin/sh', '-c', RECORD_SCRIPT, 'sh', file],
-    env: { PATH: `/opt/homebrew/bin:/usr/local/bin:${path}` },
-  })
+  let device = microphone
+  if (platform === 'windows' && !device) {
+    device = (await listDevices($).catch(() => []))[0]?.id ?? ''
+    if (!device) {
+      await fail($, 'no microphone found')
+
+      return
+    }
+  }
+
+  const file = await tempFile($, `speech-insert-${await $.clock.now()}.mp3`)
+  const stream = $.process.spawn({ argv: recordArgv(device, file), env: await toolEnv($) })
 
   let foundPid: (pid: string | null) => void = () => {}
   const pid = new Promise<string | null>(resolve => {
     foundPid = resolve
   })
+  if (platform === 'windows') {
+    foundPid(null)
+  }
   const done = (async () => {
     let stderr = ''
     let code: number | null = null
@@ -212,87 +579,27 @@ const startRecording = async ($: EngineInterface) => {
     if (recorder === own && (await read($, phase)) === 'recording') {
       recorder = null
       stopTicker()
+      await removeFile($, file)
       const reason = stderr.trim().split('\n').pop() || 'ffmpeg exited'
-      await fail($, `recording failed: ${reason}`)
+      const hint = microphone ? '. Pick another microphone in ⚙' : ''
+      await fail($, `recording failed: ${reason}${hint}`)
     }
   })
 }
 
-const transcribe = async ($: EngineInterface, file: string) => {
-  const { token, baseUrl, model, language } = await loadSettings($)
-  const argv = [
-    'curl',
-    '-sS',
-    '--max-time',
-    '120',
-    '-X',
-    'POST',
-    transcriptionUrl(baseUrl),
-    // The token goes in on stdin, so it never shows in a process listing.
-    '-H',
-    '@-',
-    '-F',
-    `file=@${file};type=audio/mpeg`,
-    '--form-string',
-    `model=${model.trim() || DEFAULTS.model}`,
-    ...(language.trim() ? ['--form-string', `language=${language.trim()}`] : []),
-    '--form-string',
-    'response_format=json',
-    '-w',
-    '\n%{http_code}',
-  ]
-  const ran = await $.process.run(argv, {
-    stdin: `Authorization: Bearer ${token}\n`,
-    timeoutMs: 130_000,
-  })
-  if (ran.exitCode !== 0) {
-    throw new Error(ran.stderr.trim() || `curl exited with code ${ran.exitCode}`)
-  }
-
-  const cut = ran.stdout.lastIndexOf('\n')
-  const body = ran.stdout.slice(0, cut)
-  const status = Number(ran.stdout.slice(cut + 1))
-  let parsed: { text?: unknown; error?: { message?: unknown } | string } = {}
-  try {
-    parsed = JSON.parse(body)
-  } catch {
-    // Not JSON: the status and the raw body say what happened.
-  }
-  if (status < 200 || status >= 300) {
-    const message = typeof parsed.error === 'string' ? parsed.error : parsed.error?.message
-    throw new Error(`HTTP ${status}: ${String(message ?? body).slice(0, 300)}`)
-  }
-  if (typeof parsed.text !== 'string') {
-    throw new Error(`no text field in the response: ${body.slice(0, 300)}`)
-  }
-
-  return parsed.text.trim()
-}
-
-const insertAtCursor = async ($: EngineInterface, text: string) => {
-  const box = await $.prompt.read()
-  const before = box.text.slice(0, box.cursor)
-  const after = box.text.slice(box.cursor)
-  const lead = before && !/\s$/.test(before) ? ' ' : ''
-  const trail = after && !/^\s/.test(after) ? ' ' : ''
-  const filled = await $.prompt.fill({ text: lead + text + trail, mode: 'insert' })
-  if (!filled.isFilled) {
-    await $.ui.copy({ text })
-    $.ui.toast('Speech: no prompt box to fill, the text was copied to the clipboard')
-  }
-}
-
 // SIGINT lets ffmpeg finish the file; one that has not exited in five
-// seconds is killed.
+// seconds, or that has no pid to signal (Windows), is killed.
 const endRecorder = async ($: EngineInterface, own: Recorder) => {
   const pid = await own.pid
   if (pid) {
     await $.process.run(['kill', '-INT', pid])
+    const stopped = await Promise.race([own.done.then(() => true), $.clock.sleep(5000).then(() => false)])
+    if (stopped) {
+      return
+    }
   }
-  const stopped = await Promise.race([own.done.then(() => true), $.clock.sleep(5000).then(() => false)])
-  if (!stopped) {
-    own.kill()
-  }
+  own.kill()
+  await Promise.race([own.done, $.clock.sleep(2000)])
 }
 
 const cancelRecording = async ($: EngineInterface) => {
@@ -307,9 +614,36 @@ const cancelRecording = async ($: EngineInterface) => {
   try {
     await endRecorder($, own)
   } finally {
-    await $.process.run(['rm', '-f', own.file]).catch(() => undefined)
+    await removeFile($, own.file)
   }
   $.ui.toast('Speech: recording discarded')
+}
+
+// A failed transcription keeps the file and offers ↻; the rest end with it
+// deleted.
+const sendRecording = async ($: EngineInterface, file: string) => {
+  await update($, phase, () => 'transcribing')
+  await update($, error, () => null)
+  await update($, canRetry, () => false)
+  failed = null
+  let text: string
+  try {
+    text = await transcribe($, await loadSettings($), file)
+  } catch (thrown) {
+    failed = file
+    await update($, canRetry, () => true)
+    await fail($, thrown instanceof Error ? thrown.message : String(thrown))
+
+    return
+  }
+  await removeFile($, file)
+  if (text) {
+    await insertAtCursor($, text)
+    await remember($, text)
+  } else {
+    $.ui.toast('Speech: no speech recognized')
+  }
+  await update($, phase, () => 'idle')
 }
 
 const stopRecording = async ($: EngineInterface) => {
@@ -326,25 +660,25 @@ const stopRecording = async ($: EngineInterface) => {
 
   try {
     await endRecorder($, own)
-
     const stat = await $.fs.stat(own.file).catch(() => undefined)
     if (!stat || stat.size < 1000) {
+      await removeFile($, own.file)
       await fail($, 'the recording is empty: check microphone access')
 
       return
     }
-
-    const text = await transcribe($, own.file)
-    if (text) {
-      await insertAtCursor($, text)
-    } else {
-      $.ui.toast('Speech: no speech recognized')
-    }
-    await update($, phase, () => 'idle')
   } catch (thrown) {
+    await removeFile($, own.file)
     await fail($, thrown instanceof Error ? thrown.message : String(thrown))
-  } finally {
-    await $.process.run(['rm', '-f', own.file]).catch(() => undefined)
+
+    return
+  }
+  await sendRecording($, own.file)
+}
+
+const retry = async ($: EngineInterface) => {
+  if (failed && (await read($, phase)) === 'idle') {
+    await sendRecording($, failed)
   }
 }
 
@@ -357,6 +691,29 @@ const toggleRecording = async ($: EngineInterface) => {
   }
 }
 
+const microphonePicker = async ($: EngineInterface, e: ResolveInput, chosen: string) => {
+  const { Box, Button, Text } = $.ui.resolve(e)
+  const problem = await read($, devicesError)
+  if (problem) {
+    return <Text color="red">{problem}</Text>
+  }
+  const found = await read($, devices)
+  if (found === null) {
+    return <Text dimColor>Looking for microphones…</Text>
+  }
+
+  return (
+    <Box flexDirection="column">
+      {[defaultDevice(), ...found].map((device, index) => (
+        <Button key={`device-${index}`} plain onPress={() => void pickMicrophone($, device)}>
+          {device.id === chosen ? '● ' : '○ '}
+          {device.name}
+        </Button>
+      ))}
+    </Box>
+  )
+}
+
 const settingsForm = async ($: EngineInterface, e: ResolveInput) => {
   const { Box, Button, Text } = $.ui.resolve(e)
   if (e.surface === 'mobile') {
@@ -366,52 +723,133 @@ const settingsForm = async ($: EngineInterface, e: ResolveInput) => {
   const { Input } = $.ui.resolve(e)
   const settings = await read($, config)
   const editing = await read($, settingsField)
+  const tested = await read($, test)
   const saved: Record<SpeechInsertField, string> = {
     baseUrl: settings.baseUrl,
     token: '',
     model: settings.model,
     language: settings.language,
+    microphone: settings.microphoneName || settings.microphone,
   }
   const placeholders: Record<SpeechInsertField, string> = {
     baseUrl: DEFAULTS.baseUrl,
     token: settings.tokenHint ? `saved …${settings.tokenHint}` : 'sk-…',
     model: DEFAULTS.model,
     language: 'auto-detect',
+    microphone: defaultDevice().name,
   }
   const shown = (field: SpeechInsertField) => {
     if (field === 'token') {
       return draft.token ? 'new token, not saved yet' : placeholders.token
     }
+    if (field === 'microphone') {
+      return saved.microphone
+    }
 
     return draft[field] ?? saved[field]
   }
+  const value = async (field: SpeechInsertField) => {
+    if (field !== editing) {
+      return (
+        <Button
+          key={`edit-${field}`}
+          plain
+          onPress={() => void (field === 'microphone' ? chooseMicrophone($) : update($, settingsField, () => field))}
+        >
+          {shown(field) || <Text dimColor>{placeholders[field]}</Text>}
+        </Button>
+      )
+    }
+    if (field === 'microphone') {
+      return microphonePicker($, e, settings.microphone)
+    }
+
+    return (
+      <Input
+        key={`value-${field}`}
+        value={draft[field] ?? saved[field]}
+        placeholder={placeholders[field]}
+        submitLabel="Save"
+        autoFocus
+        onInput={typed => {
+          draft = { ...draft, [field]: typed }
+        }}
+        onSubmit={() => void saveSettings($)}
+      />
+    )
+  }
+  const rows = await Promise.all(FIELDS.map(async field => ({ ...field, element: await value(field.value) })))
 
   return (
     <Box flexDirection="column" rowGap={1}>
-      {FIELDS.map(({ value: field, label }) => (
+      {rows.map(({ label, element }) => (
         <Box flexDirection="row" alignItems="center" columnGap={1}>
           <Box width={10} flexShrink={0}>
             <Text dimColor>{label}</Text>
           </Box>
-          <Box flexGrow={1}>
-            {field === editing ? (
-              <Input
-                key={`value-${field}`}
-                value={draft[field] ?? saved[field]}
-                placeholder={placeholders[field]}
-                submitLabel="Save"
-                autoFocus
-                onInput={value => {
-                  draft = { ...draft, [field]: value }
-                }}
-                onSubmit={() => void saveSettings($)}
-              />
-            ) : (
-              <Button key={`edit-${field}`} plain onPress={() => update($, settingsField, () => field)}>
-                {shown(field) || <Text dimColor>{placeholders[field]}</Text>}
-              </Button>
-            )}
+          <Box flexGrow={1}>{element}</Box>
+        </Box>
+      ))}
+      <Box flexDirection="row" alignItems="center" columnGap={1}>
+        <Box width={10} flexShrink={0} />
+        <Button key="test" label="Test" dimColor={tested?.state === 'running'} onPress={() => void testSettings($)} />
+        {tested !== null && (
+          <Text
+            color={tested.state === 'passed' ? 'green' : tested.state === 'failed' ? 'red' : undefined}
+            dimColor={tested.state === 'running'}
+            wrap="truncate-end"
+          >
+            {tested.state === 'passed'
+              ? `✓ ${tested.message}`
+              : tested.state === 'failed'
+                ? `✗ ${tested.message}`
+                : tested.message}
+          </Text>
+        )}
+      </Box>
+    </Box>
+  )
+}
+
+const ageOf = (ms: number) => {
+  const minutes = Math.floor(Math.max(0, ms) / 60_000)
+  if (minutes < 1) {
+    return 'now'
+  }
+  if (minutes < 60) {
+    return `${minutes}m`
+  }
+
+  return minutes < 24 * 60 ? `${Math.floor(minutes / 60)}h` : `${Math.floor(minutes / (24 * 60))}d`
+}
+
+// One line per transcription, cut to the band's width; a press puts it at the
+// cursor, as a new one would go.
+const historyList = async ($: EngineInterface, e: ResolveInput, columns: number) => {
+  const { Box, Button, Text } = $.ui.resolve(e)
+  const items = await read($, history)
+  if (items.length === 0) {
+    return <Text dimColor>Nothing transcribed yet.</Text>
+  }
+
+  const now = await $.clock.now()
+  const width = Math.max(20, columns - 8)
+  const clip = (text: string) => {
+    const line = text.replace(/\s+/g, ' ')
+
+    return line.length > width ? `${line.slice(0, width - 1)}…` : line
+  }
+
+  return (
+    <Box flexDirection="column">
+      {items.map((item, index) => (
+        <Box flexDirection="row" columnGap={1}>
+          <Box width={4} flexShrink={0}>
+            <Text dimColor>{ageOf(now - item.at)}</Text>
           </Box>
+          <Button key={`history-${index}`} plain onPress={() => void pickHistory($, item)}>
+            {clip(item.text)}
+          </Button>
         </Box>
       ))}
     </Box>
@@ -470,7 +908,11 @@ const hide = async ($: EngineInterface) => {
   if ((await read($, phase)) === 'recording') {
     await cancelRecording($)
   }
+  if (failed) {
+    await discardFailed($)
+  }
   await closeSettings($)
+  await update($, isHistoryOpen, () => false)
 }
 
 type Switch = 'speech-on' | 'speech-off' | 'speech-chat-on' | 'speech-chat-off'
@@ -509,7 +951,9 @@ const runSwitch = async ($: EngineInterface, name: Switch) => {
 const toolbar = async ($: EngineInterface, e: ResolveInput) => {
   const now = await read($, phase)
   const isOpen = await read($, isSettingsOpen)
+  const isListed = await read($, isHistoryOpen)
   const problem = await read($, error)
+  const isRetryable = now === 'idle' && (await read($, canRetry))
   const seconds = now === 'recording' ? await read($, elapsed) : 0
   const heights = now === 'recording' ? await read($, levels) : []
   const isConfirming = now === 'recording' && (await read($, isConfirmingCancel))
@@ -524,6 +968,12 @@ const toolbar = async ($: EngineInterface, e: ResolveInput) => {
         label="⚙"
         dimColor={!isOpen}
         onPress={() => void (isOpen ? closeSettings($) : openSettings($))}
+      />
+      <Button
+        key="history"
+        label="🕘"
+        dimColor={!isListed}
+        onPress={() => void (isListed ? update($, isHistoryOpen, () => false) : openHistory($))}
       />
       {now === 'recording' ? (
         <Button key="mic" variant="primary" onPress={() => void toggleRecording($)}>
@@ -542,6 +992,8 @@ const toolbar = async ($: EngineInterface, e: ResolveInput) => {
         <Button key="keep" label="No" variant="primary" onPress={() => update($, isConfirmingCancel, () => false)} />
       )}
       {status !== '' && !isConfirming && <Text dimColor>{status}</Text>}
+      {isRetryable && <Button key="retry" label="↻ Retry" onPress={() => void retry($)} />}
+      {isRetryable && <Button key="dismiss" label="✕" dimColor onPress={() => void discardFailed($)} />}
       {status === '' && problem !== null && (
         <Text color="red" wrap="truncate-end">
           {problem}
@@ -553,11 +1005,14 @@ const toolbar = async ($: EngineInterface, e: ResolveInput) => {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    platform = await detectPlatform($)
     await loadSettings($)
     await loadSwitches($)
     await update($, phase, () => 'idle')
     await update($, isConfirmingCancel, () => false)
     await update($, isSettingsOpen, () => false)
+    await update($, isHistoryOpen, () => false)
+    await update($, canRetry, () => false)
     await $.command.register({
       name: 'speech-on',
       description: 'Show the speech-insert mic in every chat',
@@ -605,16 +1060,28 @@ export const register: Register = on => {
       return next(e)
     }
 
+    // The band is one for every plugin: what the hooks beneath draw (another
+    // mod's band) stays on top, and the mic sits right above the prompt.
     const { Box } = $.ui.resolve(e)
+    const beneath = await next(e)
     const bar = await toolbar($, e)
-    if (!(await read($, isSettingsOpen))) {
-      return bar
-    }
+    const panel = (await read($, isSettingsOpen))
+      ? await settingsForm($, e)
+      : (await read($, isHistoryOpen))
+        ? await historyList($, e, e.props.bodyColumns)
+        : null
 
     return (
-      <Box flexDirection="column" rowGap={1}>
-        {await settingsForm($, e)}
-        {bar}
+      <Box flexDirection="column">
+        {beneath}
+        {panel === null ? (
+          bar
+        ) : (
+          <Box flexDirection="column" rowGap={1}>
+            {panel}
+            {bar}
+          </Box>
+        )}
       </Box>
     )
   })
