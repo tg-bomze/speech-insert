@@ -1,0 +1,13 @@
+{
+  "name": "speech-insert",
+  "description": "Voice dictation for the Claude Code prompt",
+  "owner": {
+    "name": "Denis Malimonov"
+  },
+  "plugins": [
+    {
+      "name": "speech-insert",
+      "source": "./"
+    }
+  ]
+}
