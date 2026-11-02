@@ -17,7 +17,8 @@ const BAND = {
 
 // The plugin's store, toasts and clock, answered from memory beneath it, and
 // the prompt band a hidden mod leaves to whoever draws beneath.
-const world = (on: On, beneath = 'prompt') => {
+// `beneath` is what the hooks under the mod draw; null, the engine's empty band.
+const world = (on: On, beneath: string | null = 'prompt') => {
   const stored = new Map<string, unknown>()
   on('store.get', (_, e) => ({ value: stored.get(e.key) }))
   on('store.set', (_, e) => {
@@ -36,7 +37,8 @@ const world = (on: On, beneath = 'prompt') => {
   on('ui.render', ($, e) => {
     const { Text } = $.ui.resolve(e)
 
-    return <Text>{beneath}</Text>
+    // The engine hands its own drawing on as a reference.
+    return beneath === null ? ({ type: 'engine', ref: 1 } as never) : <Text>{beneath}</Text>
   })
 
   return { stored, clock: mock.clock(on) }
@@ -321,6 +323,23 @@ test("another mod's band stays, above the mic", async ($, on) => {
   await ui.press({ key: 'settings' })
   expect(await ui.find({ type: 'Text', text: "Claude's edits" })).toBeDefined()
   expect(await ui.find({ key: 'value-baseUrl' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('no gap goes above the engine’s empty band, one goes under another mod’s', async ($, on) => {
+  world(on, null)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const alone = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await alone.find({ key: 'mic' })).toBeDefined()
+  expect((await alone.findAll({ type: 'Box' })).some(box => box.props.rowGap === 'lg')).toBe(false)
+  await alone.unmount()
+})
+
+test('a gap goes between another mod’s band and the mic', async ($, on) => {
+  world(on, "Claude's edits")
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await ui.findAll({ type: 'Box' })).some(box => box.props.rowGap === 'lg')).toBe(true)
   await ui.unmount()
 })
 

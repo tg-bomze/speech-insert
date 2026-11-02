@@ -1003,6 +1003,27 @@ const toolbar = async ($: EngineInterface, e: ResolveInput) => {
   )
 }
 
+// What draws nothing of a plugin's: no node, an empty string, the engine's
+// own drawing (`{ type: 'engine' }`, empty unless a survey holds the band), or
+// a Box or Text holding only such. No gap goes above that.
+const isBlank = (node: unknown): boolean => {
+  if (node === undefined || node === null || node === false) {
+    return true
+  }
+  if (typeof node === 'string') {
+    return node.trim() === ''
+  }
+  if (typeof node !== 'object') {
+    return false
+  }
+  const { type, children } = node as { type?: unknown; children?: unknown[] }
+  if (type === 'engine') {
+    return true
+  }
+
+  return (type === 'Box' || type === 'Text') && (children ?? []).every(isBlank)
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     platform = await detectPlatform($)
@@ -1071,17 +1092,20 @@ export const register: Register = on => {
         ? await historyList($, e, e.props.bodyColumns)
         : null
 
+    const own =
+      panel === null ? (
+        bar
+      ) : (
+        <Box flexDirection="column" rowGap={1}>
+          {panel}
+          {bar}
+        </Box>
+      )
+
     return (
-      <Box flexDirection="column">
+      <Box flexDirection="column" rowGap={isBlank(beneath) ? 0 : 'lg'}>
         {beneath}
-        {panel === null ? (
-          bar
-        ) : (
-          <Box flexDirection="column" rowGap={1}>
-            {panel}
-            {bar}
-          </Box>
-        )}
+        {own}
       </Box>
     )
   })
